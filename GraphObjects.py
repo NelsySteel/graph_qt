@@ -1,3 +1,4 @@
+from types import NoneType
 from typing import Any
 from pygame import Vector2
 from Utils import *
@@ -5,7 +6,7 @@ from PyQt5.QtWidgets import QWidget
 from PyQt5.QtGui import QPainter, QColor, QColorConstants, QInputEvent
 from PyQt5.QtCore import Qt, QEvent
 from random import choice as get_random
-from math import sqrt
+from math import ceil, floor, sqrt
 
 colors = (
     '#e6ccff',
@@ -40,7 +41,7 @@ class GraphicsFigure:
     def GetHint(self): ...
     
 class Node(GraphicsFigure):
-    height : int = 30
+    height : int = 10
     width : int = height * 2
     def __init__(self, parent):
         #top-left corner coordinates
@@ -79,6 +80,7 @@ class Node(GraphicsFigure):
                 #start moving
                 if self.IsIntersectingPoint(mousePos):
                     self.moving = True
+                    self.original_pos = self.pos.Clone()
                     center = self.GetCenter()
                     self.offset = center - mousePos
                     self.prev_mouse_pos = mousePos
@@ -108,6 +110,7 @@ class Node(GraphicsFigure):
             if event.button() == Qt.MouseButton.LeftButton:
                 #end moving
                 if self.moving:
+                    self.parent.UpdateNodeGrid(self, self.original_pos)
                     self.moving = False
                     self.offset = None
                     self.original_pos = None
@@ -145,7 +148,6 @@ class Node(GraphicsFigure):
     
 class Link(GraphicsFigure):
     color = QColorConstants.Black
-
     def __init__(self, node1: Node, node2: Node = None):
         self.firstNode = node1
         self.secondNode = node2
@@ -197,7 +199,7 @@ class Link(GraphicsFigure):
         #takes "safe" area - offset - into account
         #to allow to click near the line
         return distance < offset
-    
+
     def SetSecondNode(self, node : Node):
         self.secondNode = node
         self.unfinished = False
@@ -216,19 +218,35 @@ class Link(GraphicsFigure):
 
 #holds all objects and processes relative actions
 class Graph:
+    gridSize = Node.width * 2
     def __init__(self, parentWidget : QWidget):
         self.parent = parentWidget
 
         #order in this list influences render order
         self.objects: list[GraphicsFigure] = []
 
+        #grid is used to optimize object intersection - only nearby nodes are checked
+        #i didn't refactor self.objects - grid can in fact be used to store nodes, but it's used only for intersection
+        #render and input processing still use self.objects
+        #yeah, it influences app memory, but it doesn't influence performance and I didn't have time to refactor =)
+        self.grid : dict[tuple[int, int], list[GraphicsFigure]] = {}
+
         #link which is in progress of creation
         #added to container after successfull creation
         self.currentLink:Link = None
 
+    def GetNodeGrid(self, node:Node):
+        x = node.pos.x // self.gridSize
+        y = node.pos.y // self.gridSize
+        return (x,y)
+
     def AddNode(self, node:Node):   
         #appending nodes to back so that links are always rendered first
         self.objects.append(node)
+        cell = self.GetNodeGrid(node)
+        if not cell in self.grid:
+            self.grid[cell] = []
+        self.grid[cell].append(node)
 
     def AddLink(self, link : Link):
         #appending links to front so that links are always rendered first
@@ -240,6 +258,11 @@ class Graph:
             if type(object) == Link:
                 if object.firstNode == node or object.secondNode == node:
                     self.objects.remove(object)
+        prev_cell = (node.pos.x // self.gridSize, node.pos.y // self.gridSize)
+        if prev_cell in self.grid:
+                self.grid[prev_cell].remove(node)
+                if len(self.grid[prev_cell]) == 0:
+                    self.grid.pop(prev_cell)
 
     def RemoveLink(self, link : Link):
         self.objects.remove(link)
@@ -249,6 +272,23 @@ class Graph:
             self.RemoveNode(object)    
         elif type(object) == Link:
             self.RemoveLink(object)
+
+    def UpdateNodeGrid(self, node:Node, original_pos:Vector2d = Vector2d(-1, -1)):
+        prev_cell = (original_pos.x // self.gridSize, original_pos.y // self.gridSize)
+        new_cell = self.GetNodeGrid(node)
+        if not new_cell in self.grid:
+            self.grid[new_cell] = []
+        if new_cell != prev_cell:
+            #removing node from previous cell if it is valid (will be invalid for new nodes)
+            #i remove empty cells to avoid checking them for intersection
+            if prev_cell in self.grid:
+                self.grid[prev_cell].remove(node)
+                if len(self.grid[prev_cell]) == 0:
+                    self.grid.pop(prev_cell)
+            
+            #moving node to new grid
+            self.grid[new_cell].append(node)
+
 
     def GetObjectUnderMouse(self, mouse_pos:Vector2d, filter_type = None):
         #order is reversed in self.objects (for rendering)
@@ -264,6 +304,19 @@ class Graph:
         hint_text = object.GetHint()
         DrawTextFrame(hint_text, mouse_pos, painter)
 
+    # renders visualization of objects grid on screen (just for hint)
+    def RenderGrid(self, painter:QPainter):
+        painter.setPen(QColorConstants.LightGray)
+        x = 0
+        y = 0
+        while y < self.parent.height():
+            painter.drawLine(0, y, self.parent.width(), y)
+            y += Graph.gridSize
+
+        while x < self.parent.width():
+            painter.drawLine(x, 0, x, self.parent.height())
+            x += Graph.gridSize 
+
     def RenderHint(self, painter:QPainter, mouse_pos:Vector2d):
         hint_object = self.GetObjectUnderMouse(mouse_pos)
         if hint_object:
@@ -274,7 +327,15 @@ class Graph:
             object.Render(painter)
         if self.currentLink != None:
             self.currentLink.Render(painter)
-        
+    
+    def ProcessIntersectionIsCell(self, node:Node, cell:tuple[int, int]):
+        if cell in self.grid:
+            for otherObject in self.grid[cell]:
+                if otherObject != node:
+                    if node.IsIntersectingOther(otherObject):
+                        return True
+            return False
+    
     def IsValidNodePosition(self, node:Node):
         #edges
         if node.pos.x + node.width > self.parent.size().width() or node.pos.x < 0:
@@ -284,19 +345,16 @@ class Graph:
             return False
 
         #intersection with other nodes
-        for otherObject in self.objects:
-            if type(otherObject) == Node:
-                if otherObject != node:
-                    if node.IsIntersectingOther(otherObject):
-                        return False
+        current_cell = self.GetNodeGrid(node)
+        #check all 9 cells - the one in which thenode is and all it's neighbors
+        for i in [current_cell[0] - 1, current_cell[0], current_cell[0]+1]:
+            for j in [current_cell[1] - 1, current_cell[1], current_cell[1]+1]:
+                if i>=0 and j>=0:   #valid cell index (left and top)
+                    if i<= (self.parent.width() // Graph.gridSize) and j<= (self.parent.height() // Graph.gridSize):#valid cell index (bottom and right)
+                        if self.ProcessIntersectionIsCell(node, (i, j)):
+                            return False
         return True
-
-    def CanPlaceNode(self, node: Node):
-        if self.IsValidNodePosition(node):
-            return True
-        CreateWarningMessage("Node doesn't fit!")
-        return False
-            
+        
     #check if link between two nodes (any order) exists        
     def IsLinkExists(self, node1 : Node, node2 : Node):
         for object in self.objects:
@@ -310,6 +368,35 @@ class Graph:
                 if  (firstSame and secondSame) or (firstEqualsSecond and secondEqualsFirst):
                     return True
         return False
+
+    def CreateNode(self, pos:Vector2d, isCenter = True):
+        newNode = Node(self)
+        if isCenter:
+            newNode.MoveCenterTo(pos.x, pos.y)
+        else:
+            newNode.pos = pos
+
+        if self.IsValidNodePosition(newNode):
+            self.AddNode(newNode)
+            return True
+        return False
+
+    def FillWindow(self):
+        margin_size = Node.width//2
+        margin = Vector2d(margin_size, margin_size)
+        cell_size = Vector2d(Node.width + margin.x, Node.height + margin.y)
+        window_width = self.parent.width()
+        window_height = self.parent.height()
+
+        cell_pos = Vector2d()
+
+        while cell_pos.y<=window_height - Node.height:
+            while cell_pos.x <= window_width - Node.width:
+                self.CreateNode(cell_pos + margin, False)
+                cell_pos.x += cell_size.x
+            cell_pos.x = 0
+            cell_pos.y += cell_size.y
+                 
 
     def StartCreatingLink(self, mouse_pos : Vector2d):
         underlyiing_node = self.GetObjectUnderMouse(mouse_pos, Node)
@@ -333,11 +420,7 @@ class Graph:
         if type == QEvent.MouseButtonDblClick:
             if event.button() == Qt.MouseButton.LeftButton:
                 #creating new node
-                newNode = Node(self)
-                newNode.MoveCenterTo(mousePos.x, mousePos.y)
-                if self.CanPlaceNode(newNode):
-                    self.AddNode(newNode)
-                    result = True
+                result |= self.CreateNode(mousePos)
         
         elif type == QEvent.MouseButtonPress:
             #creating new link by dragging RMB
@@ -360,8 +443,8 @@ class Graph:
                     result = True
         
         if self.currentLink:
-            result = result or self.currentLink.ProcessInput(event)
+            result |= self.currentLink.ProcessInput(event)
         for link in self.objects:
-            result = result or link.ProcessInput(event)
+            result |= link.ProcessInput(event)
         return result
         

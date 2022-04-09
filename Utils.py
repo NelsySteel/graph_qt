@@ -8,7 +8,7 @@ def ClampInt(n :int, min_n:int = 0, max_n:int = 1):
 
 #The simplest vector - i don't need anything else so didn't use anymore complex ones
 class Vector2d:
-    def __init__(self, x, y):
+    def __init__(self, x = 0, y = 0):
         self.x = int(x)
         self.y = int(y)
 
